@@ -43,9 +43,9 @@ class ScannetPreprocessing(BasePreprocessing):
             scans_folder = "scans_test" if mode == "test" else "scans"
             filepaths = []
             for scene in split_file:
-                filepaths.append(
-                    self.data_dir / scans_folder / scene / (scene + "_vh_clean_2.ply")
-                )
+                filepath = self.data_dir / scans_folder / scene / (scene + "_vh_clean_2.ply")
+                if filepath.exists():
+                    filepaths.append(filepath)
             self.files[mode] = natsorted(filepaths)
 
     def create_label_database(self, git_repo):

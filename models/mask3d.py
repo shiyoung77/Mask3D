@@ -1,7 +1,7 @@
 import torch
 import hydra
 import torch.nn as nn
-import MinkowskiEngine.MinkowskiOps as me
+import MinkowskiEngine as ME
 from MinkowskiEngine.MinkowskiPooling import MinkowskiAvgPooling
 import numpy as np
 from torch.nn import functional as F
@@ -146,10 +146,10 @@ class Mask3D(nn.Module):
             for i, hlevel in enumerate(self.hlevels):
                 tmp_cross_attention.append(
                     CrossAttentionLayer(
-                        d_model=self.mask_dim,
-                        nhead=self.num_heads,
-                        dropout=self.dropout,
-                        normalize_before=self.pre_norm
+                        d_model=self.mask_dim,  # mask_dim=hidden_dim=128
+                        nhead=self.num_heads,  # 8
+                        dropout=self.dropout,  # 0
+                        normalize_before=self.pre_norm  # False
                     )
                 )
 
@@ -198,12 +198,12 @@ class Mask3D(nn.Module):
         return pos_encodings_pcd
 
     def forward(self, x, point2segment=None, raw_coordinates=None, is_eval=False):
-        pcd_features, aux = self.backbone(x)
+        pcd_features, aux = self.backbone(x)  # (N, 96), [(N, 256), (N, 256), (N, 128), (N, 96), (N, 96)]
 
         batch_size = len(x.decomposed_coordinates)
 
         with torch.no_grad():
-            coordinates = me.SparseTensor(features=raw_coordinates,
+            coordinates = ME.SparseTensor(features=raw_coordinates,
                                           coordinate_manager=aux[-1].coordinate_manager,
                                           coordinate_map_key=aux[-1].coordinate_map_key,
                                           device=aux[-1].device)
@@ -220,7 +220,8 @@ class Mask3D(nn.Module):
         if self.train_on_segments:
             mask_segments = []
             for i, mask_feature in enumerate(mask_features.decomposed_features):
-                mask_segments.append(self.scatter_fn(mask_feature, point2segment[i], dim=0))
+                mask_segment = self.scatter_fn(mask_feature, point2segment[i], dim=0)
+                mask_segments.append(mask_segment)
 
         sampled_coords = None
 
@@ -238,15 +239,15 @@ class Mask3D(nn.Module):
             query_pos = self.pos_enc(sampled_coords.float(),
                                      input_range=[mins, maxs]
                                      )  # Batch, Dim, queries
-            query_pos = self.query_projection(query_pos)
+            query_pos = self.query_projection(query_pos)  # B, C, num_queries
 
             if not self.use_np_features:
-                queries = torch.zeros_like(query_pos).permute((0, 2, 1))
+                queries = torch.zeros_like(query_pos).permute((0, 2, 1))  # B, num_queries, C
             else:
                 queries = torch.stack([pcd_features.decomposed_features[i][fps_idx[i].long(), :]
                                        for i in range(len(fps_idx))])
                 queries = self.np_feature_projection(queries)
-            query_pos = query_pos.permute((2, 0, 1))
+            query_pos = query_pos.permute((2, 0, 1))  # num_queries, B, C
         elif self.random_queries:
             query_pos = torch.rand(batch_size, self.mask_dim, self.num_queries, device=x.device) - 0.5
 
@@ -268,26 +269,26 @@ class Mask3D(nn.Module):
         predictions_class = []
         predictions_mask = []
 
-        for decoder_counter in range(self.num_decoders):
-            if self.shared_decoder:
+        for decoder_counter in range(self.num_decoders):  # 3
+            if self.shared_decoder:  # True
                 decoder_counter = 0
             for i, hlevel in enumerate(self.hlevels):
                 if self.train_on_segments:
                     output_class, outputs_mask, attn_mask = self.mask_module(queries,
-                                                          mask_features,
-                                                          mask_segments,
-                                                          len(aux) - hlevel - 1,
-                                                          ret_attn_mask=True,
-                                                          point2segment=point2segment,
-                                                          coords=coords)
+                                                                             mask_features,
+                                                                             mask_segments,
+                                                                             len(aux) - hlevel - 1,  # (4, 3, 2, 1)
+                                                                             ret_attn_mask=True,
+                                                                             point2segment=point2segment,
+                                                                             coords=coords)
                 else:
                     output_class, outputs_mask, attn_mask = self.mask_module(queries,
-                                                          mask_features,
-                                                          None,
-                                                          len(aux) - hlevel - 1,
-                                                          ret_attn_mask=True,
-                                                          point2segment=None,
-                                                          coords=coords)
+                                                                             mask_features,
+                                                                             None,
+                                                                             len(aux) - hlevel - 1,
+                                                                             ret_attn_mask=True,
+                                                                             point2segment=None,
+                                                                             coords=coords)
 
                 decomposed_aux = aux[hlevel].decomposed_features
                 decomposed_attn = attn_mask.decomposed_features
@@ -349,7 +350,7 @@ class Mask3D(nn.Module):
                 batched_attn = torch.logical_or(batched_attn, m[..., None])
 
                 src_pcd = self.lin_squeeze[decoder_counter][i](batched_aux.permute((1, 0, 2)))
-                if self.use_level_embed:
+                if self.use_level_embed:  # False
                     src_pcd += self.level_embed.weight[i]
 
                 output = self.cross_attention[decoder_counter][i](
@@ -405,7 +406,7 @@ class Mask3D(nn.Module):
         }
 
     def mask_module(self, query_feat, mask_features, mask_segments, num_pooling_steps, ret_attn_mask=True,
-                                 point2segment=None, coords=None):
+                    point2segment=None, coords=None):
         query_feat = self.decoder_norm(query_feat)
         mask_embed = self.mask_embed_head(query_feat)
         outputs_class = self.class_embed_head(query_feat)
@@ -422,7 +423,7 @@ class Mask3D(nn.Module):
                 output_masks.append(mask_features.decomposed_features[i] @ mask_embed[i].T)
 
         output_masks = torch.cat(output_masks)
-        outputs_mask = me.SparseTensor(features=output_masks,
+        outputs_mask = ME.SparseTensor(features=output_masks,
                                        coordinate_manager=mask_features.coordinate_manager,
                                        coordinate_map_key=mask_features.coordinate_map_key)
 
@@ -431,7 +432,7 @@ class Mask3D(nn.Module):
             for _ in range(num_pooling_steps):
                 attn_mask = self.pooling(attn_mask.float())
 
-            attn_mask = me.SparseTensor(features=(attn_mask.F.detach().sigmoid() < 0.5),
+            attn_mask = ME.SparseTensor(features=(attn_mask.F.detach().sigmoid() < 0.5),
                                         coordinate_manager=attn_mask.coordinate_manager,
                                         coordinate_map_key=attn_mask.coordinate_map_key)
 

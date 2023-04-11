@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from random import random
 
+
 class VoxelizeCollate:
     def __init__(
             self,
@@ -35,9 +36,9 @@ class VoxelizeCollate:
         self.num_queries = num_queries
 
     def __call__(self, batch):
-        if ("train" in self.mode) and (self.small_crops or self.very_small_crops):
+        if ("train" in self.mode) and (self.small_crops or self.very_small_crops):  # False
             batch = make_crops(batch)
-        if ("train" in self.mode) and self.very_small_crops:
+        if ("train" in self.mode) and self.very_small_crops:  # False
             batch = make_crops(batch)
         return voxelize(batch, self.ignore_label, self.voxel_size, self.probing, self.mode,
                         task=self.task, ignore_class_threshold=self.ignore_class_threshold,
@@ -224,10 +225,14 @@ def voxelize(batch, ignore_label, voxel_size, probing, mode, task,
         original_normals.append(sample[5])
 
         coords = np.floor(sample[0] / voxel_size)
-        voxelization_dict.update({"coordinates": torch.from_numpy(coords).to("cpu").contiguous(), "features": sample[1]})
+        voxelization_dict.update(
+            {
+                "coordinates": torch.from_numpy(coords).to("cpu").contiguous(),
+                "features": sample[1]
+            }
+        )
 
-        # maybe this change (_, _, ...) is not necessary and we can directly get out
-        # the sample coordinates?
+        # maybe this change (_, _, ...) is not necessary, and we can directly get out the sample coordinates?
         _, _, unique_map, inverse_map = ME.utils.sparse_quantize(**voxelization_dict)
         inverse_maps.append(inverse_map)
 
@@ -248,7 +253,7 @@ def voxelize(batch, ignore_label, voxel_size, probing, mode, task,
         coordinates, features = ME.utils.sparse_collate(**input_dict)
         labels = torch.Tensor([])
 
-    if probing:
+    if probing:  # False
         return (
             NoGpu(coordinates, features, original_labels, inverse_maps, ),
             labels,

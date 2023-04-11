@@ -12,7 +12,8 @@ from benchmark.evaluate_semantic_instance import evaluate
 from collections import defaultdict
 from sklearn.cluster import DBSCAN
 from utils.votenet_utils.eval_det import eval_det
-from datasets.scannet200.scannet200_splits import HEAD_CATS_SCANNET_200, TAIL_CATS_SCANNET_200, COMMON_CATS_SCANNET_200, VALID_CLASS_IDS_200_VALIDATION
+from datasets.scannet200.scannet200_splits import HEAD_CATS_SCANNET_200, TAIL_CATS_SCANNET_200,\
+    COMMON_CATS_SCANNET_200, VALID_CLASS_IDS_200_VALIDATION
 
 import hydra
 import MinkowskiEngine as ME
@@ -33,43 +34,42 @@ def get_evenly_distributed_colors(count: int) -> List[Tuple[np.uint8, np.uint8, 
     random.shuffle(HSV_tuples)
     return list(map(lambda x: (np.array(colorsys.hsv_to_rgb(*x))*255).astype(np.uint8), HSV_tuples))
 
+
 class RegularCheckpointing(pl.Callback):
     def on_train_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule"):
         general = pl_module.config.general
         trainer.save_checkpoint(f"{general.save_dir}/last-epoch.ckpt")
         print("Checkpoint created")
 
+
 class InstanceSegmentation(pl.LightningModule):
     def __init__(self, config):
         super().__init__()
 
-        self.decoder_id = config.general.decoder_id
+        self.decoder_id = config.general.decoder_id  # -1
 
-        if config.model.train_on_segments:
+        if config.model.train_on_segments:  # true
             self.mask_type = "segment_mask"
         else:
             self.mask_type = "masks"
 
-        self.eval_on_segments = config.general.eval_on_segments
+        self.eval_on_segments = config.general.eval_on_segments  # true
 
         self.config = config
-        self.save_hyperparameters()
+        self.save_hyperparameters()  # parameters are saved to the “hyper_parameters” key in the checkpoint
+
         # model
         self.model = hydra.utils.instantiate(config.model)
-        self.optional_freeze = nullcontext
-        if config.general.freeze_backbone:
-            self.optional_freeze = torch.no_grad
+
         # loss
         self.ignore_label = config.data.ignore_label
 
         matcher = hydra.utils.instantiate(config.matcher)
-        weight_dict = {"loss_ce": matcher.cost_class,
-                       "loss_mask": matcher.cost_mask,
-                       "loss_dice": matcher.cost_dice}
+        weight_dict = {"loss_ce": matcher.cost_class, "loss_mask": matcher.cost_mask, "loss_dice": matcher.cost_dice}
 
         aux_weight_dict = {}
-        for i in range(self.model.num_levels * self.model.num_decoders):
-            if i not in self.config.general.ignore_mask_idx:
+        for i in range(self.model.num_levels * self.model.num_decoders):  # 4 * 3
+            if i not in self.config.general.ignore_mask_idx:  # ignore_mask_idx = []
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             else:
                 aux_weight_dict.update({k + f"_{i}": 0. for k, v in weight_dict.items()})
@@ -84,14 +84,36 @@ class InstanceSegmentation(pl.LightningModule):
         # metrics
         self.confusion = hydra.utils.instantiate(config.metrics)
         self.iou = IoU()
-        # misc
-        self.labels_info = dict()
+
+        # dataset
+        self.train_dataset = hydra.utils.instantiate(self.config.data.train_dataset)
+        self.validation_dataset = hydra.utils.instantiate(self.config.data.validation_dataset)
+        self.test_dataset = hydra.utils.instantiate(self.config.data.test_dataset)
+        self.labels_info = self.train_dataset.label_info
+
+    def configure_optimizers(self):
+        optimizer = hydra.utils.instantiate(self.config.optimizer, params=self.parameters())
+        if "steps_per_epoch" in self.config.scheduler.scheduler.keys():
+            self.config.scheduler.scheduler.steps_per_epoch = len(self.train_dataloader())
+        lr_scheduler = hydra.utils.instantiate(self.config.scheduler.scheduler, optimizer=optimizer)
+        scheduler_config = {"scheduler": lr_scheduler}
+        scheduler_config.update(self.config.scheduler.pytorch_lightning_params)
+        return [optimizer], [scheduler_config]
+
+    def train_dataloader(self):
+        c_fn = hydra.utils.instantiate(self.config.data.train_collation)
+        return hydra.utils.instantiate(self.config.data.train_dataloader, self.train_dataset, collate_fn=c_fn)
+
+    def val_dataloader(self):
+        c_fn = hydra.utils.instantiate(self.config.data.validation_collation)
+        return hydra.utils.instantiate(self.config.data.validation_dataloader, self.validation_dataset, collate_fn=c_fn)
+
+    def test_dataloader(self):
+        c_fn = hydra.utils.instantiate(self.config.data.test_collation)
+        return hydra.utils.instantiate(self.config.data.test_dataloader, self.test_dataset, collate_fn=c_fn)
 
     def forward(self, x, point2segment=None, raw_coordinates=None, is_eval=False):
-        with self.optional_freeze():
-            x = self.model(x, point2segment, raw_coordinates=raw_coordinates,
-                           is_eval=is_eval)
-        return x
+        return self.model(x, point2segment, raw_coordinates=raw_coordinates, is_eval=is_eval)
 
     def training_step(self, batch, batch_idx):
         data, target, file_names = batch
@@ -105,13 +127,11 @@ class InstanceSegmentation(pl.LightningModule):
             return None
 
         raw_coordinates = None
-        if self.config.data.add_raw_coordinates:
+        if self.config.data.add_raw_coordinates:  # True
             raw_coordinates = data.features[:, -3:]
             data.features = data.features[:, :-3]
 
-        data = ME.SparseTensor(coordinates=data.coordinates,
-                              features=data.features,
-                              device=self.device)
+        data = ME.SparseTensor(coordinates=data.coordinates, features=data.features, device=self.device)
 
         try:
             output = self.forward(data,
@@ -143,42 +163,18 @@ class InstanceSegmentation(pl.LightningModule):
                 # remove this loss if not specified in `weight_dict`
                 losses.pop(k)
 
-        logs = {f"train_{k}": v.detach().cpu().item() for k,v in losses.items()}
-
-        logs['train_mean_loss_ce'] = statistics.mean([item for item in [v for k, v in logs.items() if "loss_ce" in k]])
-
-        logs['train_mean_loss_mask'] = statistics.mean(
-            [item for item in [v for k, v in logs.items() if "loss_mask" in k]])
-
-        logs['train_mean_loss_dice'] = statistics.mean(
-            [item for item in [v for k, v in logs.items() if "loss_dice" in k]])
-
+        logs = {f"train_{k}": v.detach().cpu().item() for k, v in losses.items()}
+        logs['train_mean_loss_ce'] = statistics.mean([v for k, v in logs.items() if "loss_ce" in k])
+        logs['train_mean_loss_mask'] = statistics.mean([v for k, v in logs.items() if "loss_mask" in k])
+        logs['train_mean_loss_dice'] = statistics.mean([v for k, v in logs.items() if "loss_dice" in k])
         self.log_dict(logs)
         return sum(losses.values())
 
     def validation_step(self, batch, batch_idx):
         return self.eval_step(batch, batch_idx)
 
-    def export(self, pred_masks, scores, pred_classes, file_names, decoder_id):
-        root_path = f"eval_output"
-        base_path = f"{root_path}/instance_evaluation_{self.config.general.experiment_name}_{self.current_epoch}/decoder_{decoder_id}"
-        pred_mask_path = f"{base_path}/pred_mask"
-
-        Path(pred_mask_path).mkdir(parents=True, exist_ok=True)
-
-        file_name = file_names
-        with open(f"{base_path}/{file_name}.txt", "w") as fout:
-            real_id = -1
-            for instance_id in range(len(pred_classes)):
-                real_id += 1
-                pred_class = pred_classes[instance_id]
-                score = scores[instance_id]
-                mask = pred_masks[:, instance_id].astype("uint8")
-
-                if score > self.config.general.export_threshold:
-                    # reduce the export size a bit. I guess no performance difference
-                    np.savetxt(f"{pred_mask_path}/{file_name}_{real_id}.txt", mask, fmt="%d")
-                    fout.write(f"pred_mask/{file_name}_{real_id}.txt {pred_class} {score}\n")
+    def test_step(self, batch, batch_idx):
+        return self.eval_step(batch, batch_idx)
 
     def training_epoch_end(self, outputs):
         train_loss = sum([out["loss"].cpu().item() for out in outputs]) / len(outputs)
@@ -186,7 +182,26 @@ class InstanceSegmentation(pl.LightningModule):
         self.log_dict(results)
 
     def validation_epoch_end(self, outputs):
-        self.test_epoch_end(outputs)
+        self._shared_eval_test_epoch_end(outputs)
+
+    def test_epoch_end(self, outputs):
+        self._shared_eval_test_epoch_end(outputs)
+
+    def _shared_eval_test_epoch_end(self, outputs):
+        if self.config.general.export:
+            return
+
+        self.eval_instance_epoch_end()
+
+        dd = defaultdict(list)
+        for output in outputs:
+            for key, val in output.items():  # .items() in Python 3.
+                dd[key].append(val)
+        dd = {k: statistics.mean(v) for k, v in dd.items()}
+        dd['val_mean_loss_ce'] = statistics.mean([item for item in [v for k,v in dd.items() if "loss_ce" in k]])
+        dd['val_mean_loss_mask'] = statistics.mean([item for item in [v for k,v in dd.items() if "loss_mask" in k]])
+        dd['val_mean_loss_dice'] = statistics.mean([item for item in [v for k,v in dd.items() if "loss_dice" in k]])
+        self.log_dict(dd)
 
     def save_visualizations(self, target_full, full_res_coords,
                             sorted_masks, sort_classes, file_name, original_colors, original_normals,
@@ -382,25 +397,25 @@ class InstanceSegmentation(pl.LightningModule):
             if self.config.trainer.deterministic:
                 torch.use_deterministic_algorithms(True)
 
-        if self.config.general.save_visualizations:
-            backbone_features = output['backbone_features'].F.detach().cpu().numpy()
-            from sklearn import decomposition
-            pca = decomposition.PCA(n_components=3)
-            pca.fit(backbone_features)
-            pca_features = pca.transform(backbone_features)
-            rescaled_pca = 255 * (pca_features - pca_features.min()) / (pca_features.max() - pca_features.min())
-
+        # if self.config.general.save_visualizations:
+        #     backbone_features = output['backbone_features'].F.detach().cpu().numpy()
+        #     from sklearn import decomposition
+        #     pca = decomposition.PCA(n_components=3)
+        #     pca.fit(backbone_features)
+        #     pca_features = pca.transform(backbone_features)
+        #     rescaled_pca = 255 * (pca_features - pca_features.min()) / (pca_features.max() - pca_features.min())
+        #
+        # self.eval_instance_step(output, target, target_full, inverse_maps, file_names, original_coordinates,
+        #                         original_colors, original_normals, raw_coordinates, data_idx,
+        #                         backbone_features=rescaled_pca if self.config.general.save_visualizations else None)
         self.eval_instance_step(output, target, target_full, inverse_maps, file_names, original_coordinates,
                                 original_colors, original_normals, raw_coordinates, data_idx,
-                                backbone_features=rescaled_pca if self.config.general.save_visualizations else None)
+                                backbone_features=None)
 
         if self.config.data.test_mode != "test":
             return {f"val_{k}": v.detach().cpu().item() for k, v in losses.items()}
         else:
             return 0.
-
-    def test_step(self, batch, batch_idx):
-        return self.eval_step(batch, batch_idx)
 
     def get_full_res_mask(self, mask, inverse_map, point2segment_full, is_heatmap=False):
         mask = mask.detach().cpu()[inverse_map]  # full res
@@ -411,7 +426,6 @@ class InstanceSegmentation(pl.LightningModule):
             mask = mask.detach().cpu()[point2segment_full.cpu()]  # full res points
 
         return mask
-
 
     def get_mask_and_scores(self, mask_cls, mask_pred, num_queries=100, num_classes=18, device=None):
         if device is None:
@@ -424,7 +438,8 @@ class InstanceSegmentation(pl.LightningModule):
             scores_per_query, topk_indices = mask_cls.flatten(0, 1).topk(num_queries, sorted=True)
 
         labels_per_query = labels[topk_indices]
-        topk_indices = topk_indices // num_classes
+        # topk_indices = topk_indices // num_classes
+        topk_indices = torch.div(topk_indices, num_classes, rounding_mode='floor')
         mask_pred = mask_pred[:, topk_indices]
 
         result_pred_mask = (mask_pred > 0).float()
@@ -617,19 +632,19 @@ class InstanceSegmentation(pl.LightningModule):
 
                 self.bbox_gt[file_names[bid]] = bbox_data
 
-            if self.config.general.eval_inner_core == -1:
-                self.preds[file_names[bid]] = {
-                    'pred_masks': all_pred_masks[bid],
-                    'pred_scores': all_pred_scores[bid],
-                    'pred_classes': all_pred_classes[bid]
-                }
-            else:
-                # prev val_dataset
-                self.preds[file_names[bid]] = {
-                    'pred_masks': all_pred_masks[bid][self.test_dataset.data[idx[bid]]['cond_inner']],
-                    'pred_scores': all_pred_scores[bid],
-                    'pred_classes': all_pred_classes[bid]
-                }
+            # if self.config.general.eval_inner_core == -1:
+            #     self.preds[file_names[bid]] = {
+            #         'pred_masks': all_pred_masks[bid],
+            #         'pred_scores': all_pred_scores[bid],
+            #         'pred_classes': all_pred_classes[bid]
+            #     }
+            # else:
+            #     # prev val_dataset
+            #     self.preds[file_names[bid]] = {
+            #         'pred_masks': all_pred_masks[bid][self.test_dataset.data[idx[bid]]['cond_inner']],
+            #         'pred_scores': all_pred_scores[bid],
+            #         'pred_classes': all_pred_classes[bid]
+            #     }
 
             if self.config.general.save_visualizations:
                 if 'cond_inner' in self.test_dataset.data[idx[bid]]:
@@ -764,7 +779,8 @@ class InstanceSegmentation(pl.LightningModule):
                             elif class_name in TAIL_CATS_SCANNET_200:
                                 tail_results.append(np.array((float(ap), float(ap_50), float(ap_25))))
                             else:
-                                assert(False, 'class not known!')
+                                raise ValueError(f"{class_name = } not known")
+                            #     assert(False, 'class not known!')
                     else:
                         ap_results[f"{log_prefix}_{class_name}_val_ap"] = float(ap)
                         ap_results[f"{log_prefix}_{class_name}_val_ap_50"] = float(ap_50)
@@ -829,68 +845,23 @@ class InstanceSegmentation(pl.LightningModule):
         self.bbox_preds = dict()
         self.bbox_gt = dict()
 
-    def test_epoch_end(self, outputs):
-        if self.config.general.export:
-            return
+    def export(self, pred_masks, scores, pred_classes, file_names, decoder_id):
+        root_path = f"eval_output"
+        base_path = f"{root_path}/instance_evaluation_{self.config.general.experiment_name}_{self.current_epoch}/decoder_{decoder_id}"
+        pred_mask_path = f"{base_path}/pred_mask"
 
-        self.eval_instance_epoch_end()
+        Path(pred_mask_path).mkdir(parents=True, exist_ok=True)
 
-        dd = defaultdict(list)
-        for output in outputs:
-            for key, val in output.items():  # .items() in Python 3.
-                dd[key].append(val)
+        file_name = file_names
+        with open(f"{base_path}/{file_name}.txt", "w") as fout:
+            real_id = -1
+            for instance_id in range(len(pred_classes)):
+                real_id += 1
+                pred_class = pred_classes[instance_id]
+                score = scores[instance_id]
+                mask = pred_masks[:, instance_id].astype("uint8")
 
-        dd = {k: statistics.mean(v) for k, v in dd.items()}
-
-        dd['val_mean_loss_ce'] = statistics.mean([item for item in [v for k,v in dd.items() if "loss_ce" in k]])
-        dd['val_mean_loss_mask'] = statistics.mean([item for item in [v for k,v in dd.items() if "loss_mask" in k]])
-        dd['val_mean_loss_dice'] = statistics.mean([item for item in [v for k,v in dd.items() if "loss_dice" in k]])
-
-        self.log_dict(dd)
-
-    def configure_optimizers(self):
-        optimizer = hydra.utils.instantiate(
-            self.config.optimizer, params=self.parameters()
-        )
-        if "steps_per_epoch" in self.config.scheduler.scheduler.keys():
-            self.config.scheduler.scheduler.steps_per_epoch = len(
-                self.train_dataloader()
-            )
-        lr_scheduler = hydra.utils.instantiate(
-            self.config.scheduler.scheduler, optimizer=optimizer
-        )
-        scheduler_config = {"scheduler": lr_scheduler}
-        scheduler_config.update(self.config.scheduler.pytorch_lightning_params)
-        return [optimizer], [scheduler_config]
-
-    def prepare_data(self):
-        self.train_dataset = hydra.utils.instantiate(self.config.data.train_dataset)
-        self.validation_dataset = hydra.utils.instantiate(
-            self.config.data.validation_dataset
-        )
-        self.test_dataset = hydra.utils.instantiate(self.config.data.test_dataset)
-        self.labels_info = self.train_dataset.label_info
-
-    def train_dataloader(self):
-        c_fn = hydra.utils.instantiate(self.config.data.train_collation)
-        return hydra.utils.instantiate(
-            self.config.data.train_dataloader,
-            self.train_dataset,
-            collate_fn=c_fn,
-        )
-
-    def val_dataloader(self):
-        c_fn = hydra.utils.instantiate(self.config.data.validation_collation)
-        return hydra.utils.instantiate(
-            self.config.data.validation_dataloader,
-            self.validation_dataset,
-            collate_fn=c_fn,
-        )
-
-    def test_dataloader(self):
-        c_fn = hydra.utils.instantiate(self.config.data.test_collation)
-        return hydra.utils.instantiate(
-            self.config.data.test_dataloader,
-            self.test_dataset,
-            collate_fn=c_fn,
-        )
+                if score > self.config.general.export_threshold:
+                    # reduce the export size a bit. I guess no performance difference
+                    np.savetxt(f"{pred_mask_path}/{file_name}_{real_id}.txt", mask, fmt="%d")
+                    fout.write(f"pred_mask/{file_name}_{real_id}.txt {pred_class} {score}\n")
