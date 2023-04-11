@@ -153,10 +153,8 @@ class SemanticSegmentationDataset(Dataset):
 
         if Path(str(color_mean_std)).exists():
             color_mean_std = self._load_yaml(color_mean_std)
-            color_mean, color_std = (
-                tuple(color_mean_std["mean"]),
-                tuple(color_mean_std["std"]),
-            )
+            color_mean = tuple(color_mean_std["mean"])
+            color_std = tuple(color_mean_std["std"])
         elif len(color_mean_std[0]) == 3 and len(color_mean_std[1]) == 3:
             color_mean, color_std = color_mean_std[0], color_mean_std[1]
         else:

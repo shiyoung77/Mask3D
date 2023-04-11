@@ -1,5 +1,4 @@
 import gc
-from contextlib import nullcontext
 from pathlib import Path
 import statistics
 import shutil
@@ -20,6 +19,7 @@ import MinkowskiEngine as ME
 import numpy as np
 import pytorch_lightning as pl
 import torch
+import torch.nn.functional as F
 from models.metrics import IoU
 import random
 import colorsys
@@ -86,9 +86,16 @@ class InstanceSegmentation(pl.LightningModule):
         self.iou = IoU()
 
         # dataset
-        self.train_dataset = hydra.utils.instantiate(self.config.data.train_dataset)
-        self.validation_dataset = hydra.utils.instantiate(self.config.data.validation_dataset)
-        self.test_dataset = hydra.utils.instantiate(self.config.data.test_dataset)
+        # self.train_dataset = hydra.utils.instantiate(self.config.data.train_dataset)
+        # self.validation_dataset = hydra.utils.instantiate(self.config.data.validation_dataset)
+        # self.test_dataset = hydra.utils.instantiate(self.config.data.test_dataset)
+        # self.pred_dataset = hydra.utils.instantiate(self.config.data.debug_dataset)
+
+        # Debug dataset only contains one ScanNet scene, i.e. scene0645_00
+        self.train_dataset = hydra.utils.instantiate(self.config.data.debug_dataset)
+        self.validation_dataset = hydra.utils.instantiate(self.config.data.debug_dataset)
+        self.test_dataset = hydra.utils.instantiate(self.config.data.debug_dataset)
+        self.pred_dataset = hydra.utils.instantiate(self.config.data.debug_dataset)
         self.labels_info = self.train_dataset.label_info
 
     def configure_optimizers(self):
@@ -112,19 +119,16 @@ class InstanceSegmentation(pl.LightningModule):
         c_fn = hydra.utils.instantiate(self.config.data.test_collation)
         return hydra.utils.instantiate(self.config.data.test_dataloader, self.test_dataset, collate_fn=c_fn)
 
+    def predict_dataloader(self):
+        c_fn = hydra.utils.instantiate(self.config.data.test_collation)
+        return hydra.utils.instantiate(self.config.data.test_dataloader, self.pred_dataset, collate_fn=c_fn)
+
     def forward(self, x, point2segment=None, raw_coordinates=None, is_eval=False):
         return self.model(x, point2segment, raw_coordinates=raw_coordinates, is_eval=is_eval)
 
     def training_step(self, batch, batch_idx):
         data, target, file_names = batch
-
-        if data.features.shape[0] > self.config.general.max_batch_size:
-            print("data exceeds threshold")
-            raise RuntimeError("BATCH TOO BIG")
-
-        if len(target) == 0:
-            print("no targets")
-            return None
+        batch_size = len(target)
 
         raw_coordinates = None
         if self.config.data.add_raw_coordinates:  # True
@@ -132,36 +136,16 @@ class InstanceSegmentation(pl.LightningModule):
             data.features = data.features[:, :-3]
 
         data = ME.SparseTensor(coordinates=data.coordinates, features=data.features, device=self.device)
-
-        try:
-            output = self.forward(data,
-                                  point2segment=[target[i]['point2segment'] for i in range(len(target))],
-                                  raw_coordinates=raw_coordinates)
-        except RuntimeError as run_err:
-            print(run_err)
-            if 'only a single point gives nans in cross-attention' == run_err.args[0]:
-                return None
-            else:
-                raise run_err
-
-        try:
-            losses = self.criterion(output, target, mask_type=self.mask_type)
-        except ValueError as val_err:
-            print(f"ValueError: {val_err}")
-            print(f"data shape: {data.shape}")
-            print(f"data feat shape:  {data.features.shape}")
-            print(f"data feat nans:   {data.features.isnan().sum()}")
-            print(f"output: {output}")
-            print(f"target: {target}")
-            print(f"filenames: {file_names}")
-            raise val_err
+        output = self.forward(data,
+                              point2segment=[target[i]['point2segment'] for i in range(batch_size)],
+                              raw_coordinates=raw_coordinates)
+        losses = self.criterion(output, target, mask_type=self.mask_type)
 
         for k in list(losses.keys()):
             if k in self.criterion.weight_dict:
                 losses[k] *= self.criterion.weight_dict[k]
             else:
-                # remove this loss if not specified in `weight_dict`
-                losses.pop(k)
+                losses.pop(k)  # remove this loss if not specified in `weight_dict`
 
         logs = {f"train_{k}": v.detach().cpu().item() for k, v in losses.items()}
         logs['train_mean_loss_ce'] = statistics.mean([v for k, v in logs.items() if "loss_ce" in k])
@@ -171,10 +155,83 @@ class InstanceSegmentation(pl.LightningModule):
         return sum(losses.values())
 
     def validation_step(self, batch, batch_idx):
-        return self.eval_step(batch, batch_idx)
+        return self._shared_eval_test_step(batch, batch_idx)
 
     def test_step(self, batch, batch_idx):
-        return self.eval_step(batch, batch_idx)
+        return self._shared_eval_test_step(batch, batch_idx)
+
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        data, target_low_res, file_names = batch
+        if len(target_low_res) != 1:
+            print(f"Predict one scene at a time, so batch size must be 1")
+            return
+
+        target_low_res = target_low_res[0]  # batch size is 1
+        inverse_maps = data.inverse_maps[0]
+        target_full_res = data.target_full[0]
+
+        raw_coordinates = None
+        if self.config.data.add_raw_coordinates:
+            raw_coordinates = data.features[:, -3:]
+            data.features = data.features[:, :-3]
+
+        print()
+        print(f"{data.features.shape = }")
+        print(f"{data.coordinates.shape = }")
+        print(f"{raw_coordinates.shape = }")
+
+        data = ME.SparseTensor(coordinates=data.coordinates, features=data.features, device=self.device)
+        output = self.forward(data,
+                              point2segment=[target_low_res['point2segment']],
+                              raw_coordinates=raw_coordinates,
+                              is_eval=True)
+
+        pred_logits = output['pred_logits']
+        pred_masks = output['pred_masks'][0]  # batch size is 1
+        pred_logits = F.softmax(pred_logits, dim=-1)[..., :-1]  # (B=1, num_queries=150, C=200)
+
+        print(f"{pred_masks.dtype = }")
+        print(f"{pred_masks.shape = }")
+        print(f"{pred_logits.shape = }")
+
+        masks = pred_masks.detach().cpu()[target_low_res['point2segment'].cpu()]  # (n_pts_low_res, num_queries)
+        print(f"{masks.shape = }")
+
+        if self.config.general.use_dbscan:
+            new_preds = {'pred_masks': list(), 'pred_logits': list()}
+
+            for query_idx in range(masks.shape[1]):  # num_queries
+                mask = masks[:, query_idx] > 0
+                masked_coordinates = raw_coordinates[mask]
+
+                if masked_coordinates.shape[0] > 0:
+                    dbscan = DBSCAN(eps=self.config.general.dbscan_eps,
+                                    min_samples=self.config.general.dbscan_min_points,
+                                    n_jobs=-1)
+                    dbscan.fit(masked_coordinates)
+                    clusters = dbscan.labels_
+
+                    new_mask = torch.zeros(mask.shape, dtype=torch.long)
+                    new_mask[mask] = torch.from_numpy(clusters) + 1
+
+                    for cluster_id in np.unique(clusters):
+                        original_pred_masks = masks[:, query_idx]
+                        if cluster_id != -1:
+                            new_preds['pred_masks'].append(original_pred_masks * (new_mask == cluster_id + 1))
+                            new_preds['pred_logits'].append(pred_logits[0, query_idx])
+
+            num_new_preds = len(new_preds['pred_masks'])  # likely > num_queries after splitting
+            print(f"{num_new_preds = }")
+
+            scores, masks, classes, heatmap = self.get_mask_and_scores(
+                torch.stack(new_preds['pred_logits']).cpu(),
+                torch.stack(new_preds['pred_masks']).T,
+                num_new_preds,
+                self.model.num_classes - 1  # 201 - 1
+            )
+
+        masks = self.get_full_res_mask(masks, inverse_maps, target_full_res['point2segment'])  # (n_pts, top_k=750)
+        print(f"{masks.shape = }")
 
     def training_epoch_end(self, outputs):
         train_loss = sum([out["loss"].cpu().item() for out in outputs]) / len(outputs)
@@ -198,9 +255,9 @@ class InstanceSegmentation(pl.LightningModule):
             for key, val in output.items():  # .items() in Python 3.
                 dd[key].append(val)
         dd = {k: statistics.mean(v) for k, v in dd.items()}
-        dd['val_mean_loss_ce'] = statistics.mean([item for item in [v for k,v in dd.items() if "loss_ce" in k]])
-        dd['val_mean_loss_mask'] = statistics.mean([item for item in [v for k,v in dd.items() if "loss_mask" in k]])
-        dd['val_mean_loss_dice'] = statistics.mean([item for item in [v for k,v in dd.items() if "loss_dice" in k]])
+        dd['val_mean_loss_ce'] = statistics.mean([v for k, v in dd.items() if "loss_ce" in k])
+        dd['val_mean_loss_mask'] = statistics.mean([v for k, v in dd.items() if "loss_mask" in k])
+        dd['val_mean_loss_dice'] = statistics.mean([v for k, v in dd.items() if "loss_dice" in k])
         self.log_dict(dd)
 
     def save_visualizations(self, target_full, full_res_coords,
@@ -332,7 +389,7 @@ class InstanceSegmentation(pl.LightningModule):
 
         v.save(f"{self.config['general']['save_dir']}/visualizations/{file_name}")
 
-    def eval_step(self, batch, batch_idx):
+    def _shared_eval_test_step(self, batch, batch_idx):
         data, target, file_names = batch
         inverse_maps = data.inverse_maps
         target_full = data.target_full
@@ -392,8 +449,7 @@ class InstanceSegmentation(pl.LightningModule):
                 if k in self.criterion.weight_dict:
                     losses[k] *= self.criterion.weight_dict[k]
                 else:
-                    # remove this loss if not specified in `weight_dict`
-                    losses.pop(k)
+                    losses.pop(k)  # remove this loss if not specified in `weight_dict`
             if self.config.trainer.deterministic:
                 torch.use_deterministic_algorithms(True)
 
@@ -415,12 +471,12 @@ class InstanceSegmentation(pl.LightningModule):
         if self.config.data.test_mode != "test":
             return {f"val_{k}": v.detach().cpu().item() for k, v in losses.items()}
         else:
-            return 0.
+            return 0
 
     def get_full_res_mask(self, mask, inverse_map, point2segment_full, is_heatmap=False):
         mask = mask.detach().cpu()[inverse_map]  # full res
 
-        if self.eval_on_segments and is_heatmap==False:
+        if self.eval_on_segments and not is_heatmap:
             mask = scatter_mean(mask, point2segment_full, dim=0)  # full res segments
             mask = (mask > 0.5).float()
             mask = mask.detach().cpu()[point2segment_full.cpu()]  # full res points
@@ -432,7 +488,7 @@ class InstanceSegmentation(pl.LightningModule):
             device = self.device
         labels = torch.arange(num_classes, device=device).unsqueeze(0).repeat(num_queries, 1).flatten(0, 1)
 
-        if self.config.general.topk_per_image != -1 :
+        if self.config.general.topk_per_image != -1:
             scores_per_query, topk_indices = mask_cls.flatten(0, 1).topk(self.config.general.topk_per_image, sorted=True)
         else:
             scores_per_query, topk_indices = mask_cls.flatten(0, 1).topk(num_queries, sorted=True)
@@ -558,7 +614,7 @@ class InstanceSegmentation(pl.LightningModule):
             sorted_masks = masks[:, sort_scores_index]
             sorted_heatmap = heatmap[:, sort_scores_index]
 
-            if self.config.general.filter_out_instances:
+            if self.config.general.filter_out_instances:  # False
                 keep_instances = set()
                 pairwise_overlap = (sorted_masks.T @ sorted_masks)
                 normalization = pairwise_overlap.max(axis=0)
