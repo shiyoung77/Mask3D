@@ -1,3 +1,4 @@
+import copy
 import gc
 from pathlib import Path
 import statistics
@@ -6,7 +7,6 @@ import os
 import math
 import pyviz3d.visualizer as vis
 from torch_scatter import scatter_mean
-import matplotlib
 from benchmark.evaluate_semantic_instance import evaluate
 from collections import defaultdict
 from sklearn.cluster import DBSCAN
@@ -25,6 +25,7 @@ import random
 import colorsys
 from typing import List, Tuple
 import functools
+import open3d as o3d
 
 
 @functools.lru_cache(20)
@@ -92,7 +93,7 @@ class InstanceSegmentation(pl.LightningModule):
         # self.pred_dataset = hydra.utils.instantiate(self.config.data.debug_dataset)
 
         # Debug dataset only contains one ScanNet scene, i.e. scene0645_00
-        self.train_dataset = hydra.utils.instantiate(self.config.data.debug_dataset)
+        self.train_dataset = hydra.utils.instantiate(self.config.data.train_dataset)
         self.validation_dataset = hydra.utils.instantiate(self.config.data.debug_dataset)
         self.test_dataset = hydra.utils.instantiate(self.config.data.debug_dataset)
         self.pred_dataset = hydra.utils.instantiate(self.config.data.debug_dataset)
@@ -156,26 +157,37 @@ class InstanceSegmentation(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         return self._shared_eval_test_step(batch, batch_idx)
+        # pass
 
     def test_step(self, batch, batch_idx):
         return self._shared_eval_test_step(batch, batch_idx)
+        # pass
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         data, target_low_res, file_names = batch
-        if len(target_low_res) != 1:
-            print(f"Predict one scene at a time, so batch size must be 1")
-            return
+        assert len(target_low_res) == 1, "Predict one scene at a time. Batch size must be 1."
 
         target_low_res = target_low_res[0]  # batch size is 1
         inverse_maps = data.inverse_maps[0]
         target_full_res = data.target_full[0]
+
+        original_coordinates = data.original_coordinates[0]
+        original_colors = data.original_colors[0]
+
+        print()
+        print(f"{original_coordinates.shape = }")
+        print(f"{original_colors.shape = }")
+
+        scene_pcd = o3d.geometry.PointCloud()
+        scene_pcd.points = o3d.utility.Vector3dVector(original_coordinates)
+        scene_pcd.colors = o3d.utility.Vector3dVector(original_colors / 255)
+        o3d.visualization.draw_geometries([scene_pcd])
 
         raw_coordinates = None
         if self.config.data.add_raw_coordinates:
             raw_coordinates = data.features[:, -3:]
             data.features = data.features[:, :-3]
 
-        print()
         print(f"{data.features.shape = }")
         print(f"{data.coordinates.shape = }")
         print(f"{raw_coordinates.shape = }")
@@ -231,7 +243,18 @@ class InstanceSegmentation(pl.LightningModule):
             )
 
         masks = self.get_full_res_mask(masks, inverse_maps, target_full_res['point2segment'])  # (n_pts, top_k=750)
-        print(f"{masks.shape = }")
+
+        top_k = 150
+        masks = masks.numpy()[:, :top_k]
+        colors = np.vstack(get_evenly_distributed_colors(masks.shape[1]))
+
+        pcd_vis = copy.deepcopy(scene_pcd)
+        pcd_vis.paint_uniform_color((0, 0, 0))
+        pcd_colors = np.asarray(pcd_vis.colors)
+        for i in range(masks.shape[1]):
+            mask = masks[:, i]
+            pcd_colors[mask > 0] = colors[i] / 255
+        o3d.visualization.draw_geometries([pcd_vis])
 
     def training_epoch_end(self, outputs):
         train_loss = sum([out["loss"].cpu().item() for out in outputs]) / len(outputs)
@@ -688,19 +711,19 @@ class InstanceSegmentation(pl.LightningModule):
 
                 self.bbox_gt[file_names[bid]] = bbox_data
 
-            # if self.config.general.eval_inner_core == -1:
-            #     self.preds[file_names[bid]] = {
-            #         'pred_masks': all_pred_masks[bid],
-            #         'pred_scores': all_pred_scores[bid],
-            #         'pred_classes': all_pred_classes[bid]
-            #     }
-            # else:
-            #     # prev val_dataset
-            #     self.preds[file_names[bid]] = {
-            #         'pred_masks': all_pred_masks[bid][self.test_dataset.data[idx[bid]]['cond_inner']],
-            #         'pred_scores': all_pred_scores[bid],
-            #         'pred_classes': all_pred_classes[bid]
-            #     }
+            if self.config.general.eval_inner_core == -1:
+                self.preds[file_names[bid]] = {
+                    'pred_masks': all_pred_masks[bid],
+                    'pred_scores': all_pred_scores[bid],
+                    'pred_classes': all_pred_classes[bid]
+                }
+            else:
+                # prev val_dataset
+                self.preds[file_names[bid]] = {
+                    'pred_masks': all_pred_masks[bid][self.test_dataset.data[idx[bid]]['cond_inner']],
+                    'pred_scores': all_pred_scores[bid],
+                    'pred_classes': all_pred_classes[bid]
+                }
 
             if self.config.general.save_visualizations:
                 if 'cond_inner' in self.test_dataset.data[idx[bid]]:

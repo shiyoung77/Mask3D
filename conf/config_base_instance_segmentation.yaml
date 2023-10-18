@@ -61,7 +61,7 @@ defaults:
   - metrics: miou
   - optimizer: adamw
   - scheduler: onecyclelr
-  - trainer: trainer600
+  - trainer: trainer  # trainer600
   - callbacks: callbacks_instance_segmentation
   - matcher: hungarian_matcher
   - loss: set_criterion

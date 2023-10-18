@@ -66,10 +66,11 @@ def train(cfg: DictConfig):
         accelerator="gpu",
         devices=cfg.general.gpus,
         callbacks=callbacks,
-        weights_save_path=str(cfg.general.save_dir),
         **cfg.trainer,
     )
+    # ckpt_path = "checkpoints/scannet200_val.ckpt"
     runner.fit(model, ckpt_path=ckpt_path)
+    # runner.fit(model)
 
 
 def test(cfg: DictConfig):
