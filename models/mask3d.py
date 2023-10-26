@@ -199,8 +199,10 @@ class Mask3D(nn.Module):
 
     def forward(self, x, point2segment=None, raw_coordinates=None, is_eval=False):
         pcd_features, aux = self.backbone(x)  # (N, 96), [(N, 256), (N, 256), (N, 128), (N, 96), (N, 96)]
+        assert pcd_features is aux[-1]
 
         batch_size = len(x.decomposed_coordinates)
+        print(f"{batch_size = }")
 
         with torch.no_grad():
             coordinates = ME.SparseTensor(features=raw_coordinates,
@@ -272,9 +274,6 @@ class Mask3D(nn.Module):
         for decoder_counter in range(self.num_decoders):  # 3
             if self.shared_decoder:  # True
                 decoder_counter = 0
-            print("==============================================")
-            print("==============================================")
-            print("==============================================")
             for i, hlevel in enumerate(self.hlevels):
                 if self.train_on_segments:
                     output_class, outputs_mask, attn_mask = self.mask_module(queries,
@@ -292,25 +291,17 @@ class Mask3D(nn.Module):
                                                                              ret_attn_mask=True,
                                                                              point2segment=None,
                                                                              coords=coords)
-                print(f"{output_class.shape = }")
-                print(f"{len(outputs_mask) = }")
-                for m in outputs_mask:
-                    print(f"{m.shape = }")
-
                 decomposed_aux = aux[hlevel].decomposed_features
                 decomposed_attn = attn_mask.decomposed_features
-                print(f"{len(decomposed_aux) = }")
-                print(f"{len(decomposed_attn) = }")
+                decomposed_attn = torch.stack(decomposed_attn)
 
                 curr_sample_size = max([pcd.shape[0] for pcd in decomposed_aux])
-                print(f"{curr_sample_size = }")
 
                 if min([pcd.shape[0] for pcd in decomposed_aux]) == 1:
                     raise RuntimeError("only a single point gives nans in cross-attention")
 
                 if not (self.max_sample_size or is_eval):
                     curr_sample_size = min(curr_sample_size, self.sample_sizes[hlevel])
-                print(f"{curr_sample_size = }")
 
                 rand_idx = []
                 mask_idx = []
@@ -345,19 +336,14 @@ class Mask3D(nn.Module):
 
                 batched_aux = torch.stack([decomposed_aux[k][rand_idx[k], :] for k in range(len(rand_idx))])
                 batched_attn = torch.stack([decomposed_attn[k][rand_idx[k], :] for k in range(len(rand_idx))])
-                print(f"{batched_aux.shape = }")
-                print(f"{batched_attn.shape = }")
 
                 batched_pos_enc = torch.stack([
                     pos_encodings_pcd[hlevel][0][k][rand_idx[k], :] for k in range(len(rand_idx))
                 ])
-                print(f"{batched_pos_enc.shape = }")
-
                 batched_attn.permute((0, 2, 1))[batched_attn.sum(1) == rand_idx[0].shape[0]] = False
 
                 m = torch.stack(mask_idx)
                 batched_attn = torch.logical_or(batched_attn, m[..., None])
-                print(f'{m.shape = }')
 
                 src_pcd = self.lin_squeeze[decoder_counter][i](batched_aux.permute((1, 0, 2)))
                 if self.use_level_embed:  # False
@@ -385,7 +371,6 @@ class Mask3D(nn.Module):
 
                 predictions_class.append(output_class)
                 predictions_mask.append(outputs_mask)
-                exit(0)
 
         if self.train_on_segments:
             output_class, outputs_mask = self.mask_module(queries,
@@ -421,24 +406,12 @@ class Mask3D(nn.Module):
         query_feat = self.decoder_norm(query_feat)
         mask_embed = self.mask_embed_head(query_feat)
         outputs_class = self.class_embed_head(query_feat)
-        print("-----------------")
-        print(f"{outputs_class.shape = }")
-        print(f"{len(mask_segments) = }")
-        # print(f"{mask_segments[0].shape = }")
-        # print(f"{mask_embed.shape = }")
-        # print(f"{mask_embed[0].shape = }")
-        # print(f"{mask_embed[0].T.shape = }")
-        print("-----------------")
 
         output_masks = []
 
         if point2segment is not None:
             output_segments = []
             for i in range(len(mask_segments)):
-                a = mask_segments[i] @ mask_embed[i].T
-                print(f"{mask_segments[i].shape = }")
-                print(f"{mask_embed[i].T.shape = }")
-                print(f"{a.shape = }")
                 output_segments.append(mask_segments[i] @ mask_embed[i].T)
                 output_masks.append(output_segments[-1][point2segment[i]])
         else:
